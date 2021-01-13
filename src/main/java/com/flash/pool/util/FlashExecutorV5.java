@@ -4,12 +4,13 @@ import java.util.HashSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 第五版
  * 1. 开始的时候和上一版一样，当 workCount < corePoolSize 时，通过创建新的 Worker 来执行任务。
- * 2. 当 workCount = corePoolSize 就停止创建新线程，把任务直接丢到队列里。
+ * 2. 当 workCount >= corePoolSize 就停止创建新线程，把任务直接丢到队列里。
  * 3. 但当队列已满且仍然 workCount < maximumPoolSize 时，不再直接走拒绝策略，而是创建非核心线程，直到 workCount = maximumPoolSize，再走拒绝策略。
  */
 public class FlashExecutorV5 implements Executor {
@@ -25,6 +26,8 @@ public class FlashExecutorV5 implements Executor {
     private volatile int maximumPoolSize;
     // 空闲时间
     private volatile long keepAliveTime;
+    // 空闲时间
+    private TimeUnit timeUnit;
     // 由调用者提供的阻塞队列，核心线程数满了之后往这里放
     private final BlockingQueue<Runnable> workQueue;
     // 拒绝策略
@@ -36,12 +39,14 @@ public class FlashExecutorV5 implements Executor {
             int corePoolSize,
             int maximumPoolSize,
             long keepAliveTime,
+            TimeUnit timeUnit,
             BlockingQueue<Runnable> workQueue,
             RejectedExecutionHandler handler,
             ThreadFactory threadFactory) {
         this.corePoolSize = corePoolSize;
         this.maximumPoolSize = maximumPoolSize;
         this.keepAliveTime = keepAliveTime;
+        this.timeUnit = timeUnit;
         this.workQueue = workQueue;
         this.handler = handler;
         this.threadFactory = threadFactory;
@@ -50,20 +55,26 @@ public class FlashExecutorV5 implements Executor {
     @Override
     public void execute(Runnable command) {
         if (workCount.get() < corePoolSize) {
-            // 工作线程数 <= 核心线程时，新建工作线程
-            Worker w = new Worker(command);
-            // 增加工作线程数
-            workCount.getAndIncrement();
-            workers.add(w);
-            // 并且把它启动
-            w.thread.start();
-        } else {
-            // 工作线程数 > 核心线程时，放入队列
-            if (!workQueue.offer(command)) {
-                // 放入队列失败，走拒绝策略
-                handler.rejectedExecution(command, this);
-            }
+            addWorker(command);
+            return;
         }
+        if (!workQueue.offer(command)) {
+            if (workCount.get() < maximumPoolSize) {
+                addWorker(command);
+                return;
+            }
+            handler.rejectedExecution(command, this);
+        }
+    }
+
+    private void addWorker(Runnable command) {
+        // 工作线程数 <= 核心线程时，新建工作线程
+        Worker w = new Worker(command);
+        // 增加工作线程数
+        workCount.getAndIncrement();
+        workers.add(w);
+        // 并且把它启动
+        w.thread.start();
     }
 
     private final class Worker implements Runnable {
@@ -83,12 +94,14 @@ public class FlashExecutorV5 implements Executor {
                 task.run();
                 task = null;
             }
+            workCount.getAndDecrement();
         }
 
         // 阻塞地从队列里获取一个任务
         private Runnable getTask() {
+            boolean timed = workCount.get() > corePoolSize;
             try {
-                return workQueue.take();
+                return timed ? workQueue.poll(keepAliveTime, timeUnit) : workQueue.take();
             } catch (InterruptedException e) {
                 return null;
             }
